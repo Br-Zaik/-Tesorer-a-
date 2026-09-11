@@ -1,0 +1,134 @@
+name: Compilar ZIP automáticamente
+
+on:
+  push:
+    paths:
+      - "*.zip"
+      - "**/*.zip"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Descargar repositorio
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Configurar Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Configurar Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.10.2"
+
+      - name: Buscar ZIP subido
+        id: zip
+        shell: bash
+        run: |
+          ZIP=""
+
+          # Intenta encontrar el ZIP agregado/modificado en este push
+          if git rev-parse HEAD^ >/dev/null 2>&1; then
+            ZIP=$(git diff --name-only HEAD^ HEAD | grep -Ei '\.zip$' | head -n 1 || true)
+          fi
+
+          # Si no lo encuentra, usa cualquier ZIP del repositorio
+          if [ -z "$ZIP" ]; then
+            ZIP=$(find . -type f -iname "*.zip" | head -n 1 || true)
+          fi
+
+          if [ -z "$ZIP" ]; then
+            echo "No se encontró ningún ZIP"
+            exit 1
+          fi
+
+          echo "ZIP encontrado: $ZIP"
+          echo "zip=$ZIP" >> "$GITHUB_OUTPUT"
+
+      - name: Extraer ZIP
+        shell: bash
+        run: |
+          rm -rf extracted
+          mkdir -p extracted
+          unzip -q "${{ steps.zip.outputs.zip }}" -d extracted
+
+      - name: Buscar proyecto Android
+        id: project
+        shell: bash
+        run: |
+          SETTINGS=$(find extracted \
+            -type f \
+            \( -name "settings.gradle.kts" -o -name "settings.gradle" \) \
+            | head -n 1)
+
+          if [ -z "$SETTINGS" ]; then
+            echo "ERROR: El ZIP no contiene settings.gradle.kts ni settings.gradle"
+            echo ""
+            echo "Contenido encontrado:"
+            find extracted -maxdepth 4 -type f | head -n 100
+            exit 1
+          fi
+
+          PROJECT_DIR=$(dirname "$SETTINGS")
+
+          echo "Proyecto Android encontrado en:"
+          echo "$PROJECT_DIR"
+
+          echo "dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
+
+      - name: Dar permiso a Gradle Wrapper
+        shell: bash
+        run: |
+          PROJECT="${{ steps.project.outputs.dir }}"
+
+          if [ -f "$PROJECT/gradlew" ]; then
+            chmod +x "$PROJECT/gradlew"
+          fi
+
+      - name: Compilar APK
+        shell: bash
+        run: |
+          PROJECT="${{ steps.project.outputs.dir }}"
+          cd "$PROJECT"
+
+          if [ -f "./gradlew" ]; then
+            ./gradlew assembleDebug --stacktrace
+          else
+            echo "No hay gradlew. Usando Gradle instalado..."
+            gradle assembleDebug --stacktrace
+          fi
+
+      - name: Buscar APK generado
+        id: apk
+        shell: bash
+        run: |
+          PROJECT="${{ steps.project.outputs.dir }}"
+
+          APK=$(find "$PROJECT" -type f -name "*.apk" | head -n 1)
+
+          if [ -z "$APK" ]; then
+            echo "ERROR: La compilación terminó pero no encontré ningún APK."
+            exit 1
+          fi
+
+          echo "APK encontrado:"
+          echo "$APK"
+
+          mkdir -p salida
+          cp "$APK" salida/app-debug.apk
+
+      - name: Subir APK a Actions
+        uses: actions/upload-artifact@v4
+        with:
+          name: APK-compilado
+          path: salida/app-debug.apk
+          if-no-files-found: error
