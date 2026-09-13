@@ -1,17 +1,23 @@
-name: Compilar ZIP automáticamente
+name: Compilar ZIP subido
 
 on:
   push:
     paths:
       - "*.zip"
       - "**/*.zip"
+  workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
-  build:
+  build-zip:
     runs-on: ubuntu-latest
+    env:
+      KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+      KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+      KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+      KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
 
     steps:
       - name: Descargar repositorio
@@ -30,105 +36,130 @@ jobs:
         with:
           gradle-version: "8.10.2"
 
-      - name: Buscar ZIP subido
+      - name: Detectar ZIP
         id: zip
         shell: bash
         run: |
           ZIP=""
-
-          # Intenta encontrar el ZIP agregado/modificado en este push
           if git rev-parse HEAD^ >/dev/null 2>&1; then
             ZIP=$(git diff --name-only HEAD^ HEAD | grep -Ei '\.zip$' | head -n 1 || true)
           fi
-
-          # Si no lo encuentra, usa cualquier ZIP del repositorio
           if [ -z "$ZIP" ]; then
-            ZIP=$(find . -type f -iname "*.zip" | head -n 1 || true)
+            ZIP=$(find . -type f -iname "*.zip" -not -path "./extracted/*" | head -n 1 || true)
           fi
-
           if [ -z "$ZIP" ]; then
             echo "No se encontró ningún ZIP"
             exit 1
           fi
-
-          echo "ZIP encontrado: $ZIP"
           echo "zip=$ZIP" >> "$GITHUB_OUTPUT"
 
       - name: Extraer ZIP
         shell: bash
         run: |
-          rm -rf extracted
-          mkdir -p extracted
+          rm -rf extracted salida
+          mkdir -p extracted salida
           unzip -q "${{ steps.zip.outputs.zip }}" -d extracted
 
-      - name: Buscar proyecto Android
+      - name: Encontrar proyecto Android
         id: project
         shell: bash
         run: |
-          SETTINGS=$(find extracted \
-            -type f \
-            \( -name "settings.gradle.kts" -o -name "settings.gradle" \) \
-            | head -n 1)
-
+          SETTINGS=$(find extracted -type f \( -name "settings.gradle.kts" -o -name "settings.gradle" \) | head -n 1)
           if [ -z "$SETTINGS" ]; then
-            echo "ERROR: El ZIP no contiene settings.gradle.kts ni settings.gradle"
-            echo ""
-            echo "Contenido encontrado:"
-            find extracted -maxdepth 4 -type f | head -n 100
+            echo "El ZIP no contiene un proyecto Gradle Android"
             exit 1
           fi
+          DIR=$(dirname "$SETTINGS")
+          echo "dir=$DIR" >> "$GITHUB_OUTPUT"
 
-          PROJECT_DIR=$(dirname "$SETTINGS")
+      - name: Verificar secretos de firma
+        shell: bash
+        run: |
+          for V in KEYSTORE_BASE64 KEYSTORE_PASSWORD KEY_ALIAS KEY_PASSWORD; do
+            if [ -z "${!V}" ]; then
+              echo "Falta el GitHub Secret $V"
+              exit 1
+            fi
+          done
 
-          echo "Proyecto Android encontrado en:"
-          echo "$PROJECT_DIR"
-
-          echo "dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
-
-      - name: Dar permiso a Gradle Wrapper
+      - name: Restaurar firma permanente
         shell: bash
         run: |
           PROJECT="${{ steps.project.outputs.dir }}"
-
-          if [ -f "$PROJECT/gradlew" ]; then
-            chmod +x "$PROJECT/gradlew"
+          KEYSTORE="$RUNNER_TEMP/tesoreria-release.jks"
+          printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$KEYSTORE"
+          if [ ! -s "$KEYSTORE" ]; then
+            echo "No se pudo reconstruir el keystore"
+            exit 1
           fi
+          echo "TESORERIA_KEYSTORE_PATH=$KEYSTORE" >> "$GITHUB_ENV"
 
-      - name: Compilar APK
+      - name: Leer versión
+        id: version
         shell: bash
         run: |
-          PROJECT="${{ steps.project.outputs.dir }}"
-          cd "$PROJECT"
+          GRADLE_FILE="${{ steps.project.outputs.dir }}/app/build.gradle.kts"
+          VERSION_CODE=$(grep -m1 -E 'versionCode[[:space:]]*=' "$GRADLE_FILE" | sed -E 's/.*=[[:space:]]*([0-9]+).*/\1/')
+          VERSION_NAME=$(grep -m1 -E 'versionName[[:space:]]*=' "$GRADLE_FILE" | sed -E 's/.*=[[:space:]]*"([^"]+)".*/\1/')
+          if [ -z "$VERSION_CODE" ] || [ -z "$VERSION_NAME" ]; then
+            echo "No se pudo leer versionCode/versionName"
+            exit 1
+          fi
+          echo "code=$VERSION_CODE" >> "$GITHUB_OUTPUT"
+          echo "name=$VERSION_NAME" >> "$GITHUB_OUTPUT"
+          echo "tag=tesoreria-v${VERSION_NAME}-vc${VERSION_CODE}" >> "$GITHUB_OUTPUT"
 
-          if [ -f "./gradlew" ]; then
-            ./gradlew assembleDebug --stacktrace
+      - name: Compilar APK release firmado
+        shell: bash
+        run: |
+          cd "${{ steps.project.outputs.dir }}"
+          if [ -f ./gradlew ]; then
+            chmod +x ./gradlew
+            ./gradlew clean assembleRelease --no-daemon --stacktrace
           else
-            echo "No hay gradlew. Usando Gradle instalado..."
-            gradle assembleDebug --stacktrace
+            gradle clean assembleRelease --no-daemon --stacktrace
           fi
 
-      - name: Buscar APK generado
-        id: apk
+      - name: Recoger APK release
         shell: bash
         run: |
-          PROJECT="${{ steps.project.outputs.dir }}"
-
-          APK=$(find "$PROJECT" -type f -name "*.apk" | head -n 1)
-
+          APK=$(find "${{ steps.project.outputs.dir }}" -type f -path "*/build/outputs/apk/release/*.apk" | head -n 1)
           if [ -z "$APK" ]; then
-            echo "ERROR: La compilación terminó pero no encontré ningún APK."
+            echo "No se encontró el APK release"
             exit 1
           fi
+          cp "$APK" salida/tesoreria.apk
+          sha256sum salida/tesoreria.apk | tee salida/tesoreria.apk.sha256
 
-          echo "APK encontrado:"
-          echo "$APK"
-
-          mkdir -p salida
-          cp "$APK" salida/app-debug.apk
-
-      - name: Subir APK a Actions
+      - name: Subir APK como artifact
         uses: actions/upload-artifact@v4
         with:
-          name: APK-compilado
-          path: salida/app-debug.apk
+          name: tesoreria-v${{ steps.version.outputs.name }}
+          path: |
+            salida/tesoreria.apk
+            salida/tesoreria.apk.sha256
           if-no-files-found: error
+
+      - name: Publicar actualización para la app
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ steps.version.outputs.tag }}"
+          TITLE="Tesorería ${{ steps.version.outputs.name }}"
+          cat > /tmp/release-notes.txt <<NOTES
+          Actualización de Tesorería ${{ steps.version.outputs.name }}.
+
+          versionCode: ${{ steps.version.outputs.code }}
+          Compilada automáticamente por GitHub Actions con la firma permanente de Tesorería.
+          NOTES
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" salida/tesoreria.apk salida/tesoreria.apk.sha256 --clobber
+            gh release edit "$TAG" --title "$TITLE" --notes-file /tmp/release-notes.txt --latest
+          else
+            gh release create "$TAG" salida/tesoreria.apk salida/tesoreria.apk.sha256 \
+              --title "$TITLE" \
+              --notes-file /tmp/release-notes.txt \
+              --latest
+          fi
